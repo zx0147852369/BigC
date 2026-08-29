@@ -4,7 +4,14 @@ import { ArrowRightLeft, Calendar as CalendarIcon, Camera, Download, FileText, M
 import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { toast } from "sonner";
 const CLOSING_REMINDER_URL =
   "/__l5e/assets-v1/99fef259-94e6-49d4-b73b-51fcc74a2781/closing-reminder-v2.png";
@@ -23,7 +30,7 @@ import { fetchSheet, saveRow, saveSheetRows, subscribeSheet } from "@/lib/stock-
 import { ExpiryTracker } from "@/components/ExpiryTracker";
 import { compressImage } from "@/lib/image-compress";
 import { scanReceiptFn } from "@/lib/receipt-scan.functions";
-import type { ScanKey } from "@/lib/receipt-scan-items";
+import { SCAN_ITEMS, type ScanKey } from "@/lib/receipt-scan-items";
 
 const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
 
@@ -37,6 +44,9 @@ const COUNTERS: { id: string; label: string; img: string }[] = [
 
 
 
+
+/** รายการที่ AI อ่านได้จากใบสรุป รอผู้ใช้ตรวจ/แก้ก่อนบันทึกลงชีต */
+type ReviewRow = { key: ScanKey; label: string; qty: number };
 
 /** รายการที่อนุญาตให้เติมยอดขายจากการถ่ายใบสรุปยอด */
 const SCAN_TO_ROW: Record<ScanKey, string> = {
@@ -69,6 +79,7 @@ export function StockSheet() {
   const [exporting, setExporting] = useState(false);
   const [syncing, setSyncing] = useState(true);
   const [scanning, setScanning] = useState(false);
+  const [review, setReview] = useState<ReviewRow[] | null>(null);
   const [reminderOpen, setReminderOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const sheetRef = useRef<HTMLDivElement>(null);
@@ -144,42 +155,24 @@ export function StockSheet() {
   };
 
 
-  // ถ่ายรูปใบสรุปยอด -> เติมยอดขายเฉพาะรายการที่กำหนด
+  // ถ่ายรูปใบสรุปยอด -> AI อ่าน -> เปิดหน้าต่างสรุปให้ตรวจ/แก้ก่อนบันทึก
   const handleReceipt = async (file: File) => {
     setScanning(true);
     const tid = toast.loading("กำลังอ่านใบสรุปยอด...");
     try {
       const image = await compressImage(file);
       const result = await scanReceiptFn({ data: { image } });
-      const sold: Record<string, number> = {};
-      for (const [key, qty] of Object.entries(result)) {
-        if (key === "ice16") continue; // น้ำแข็งเปล่าลงช่อง 16 OZ. ไม่ใช่ยอดขาย
-        const rowId = SCAN_TO_ROW[key as ScanKey];
-        if (!rowId || !qty) continue;
-        sold[rowId] = (sold[rowId] ?? 0) + qty;
-      }
-      // น้ำแข็งเปล่า 16 ออนซ์ ต้องบวกเข้าไปในยอดขายแก้ว 16 ออนซ์ด้วย
-      const ice = result.ice16 ?? 0;
-      if (ice) sold["eq-cup-16"] = (sold["eq-cup-16"] ?? 0) + ice;
-
-
-      const rowIds = Object.keys(sold);
-      if (!rowIds.length && !ice) {
+      const items: ReviewRow[] = SCAN_ITEMS.filter((it) => (result[it.key] ?? 0) > 0).map((it) => ({
+        key: it.key,
+        label: it.short,
+        qty: Math.round(result[it.key] ?? 0),
+      }));
+      if (!items.length) {
         toast.error("อ่านตัวเลขจากรูปไม่ได้ ลองถ่ายให้ชัดขึ้นครับ", { id: tid });
         return;
       }
-      setValues((prev) => {
-        const next = { ...prev };
-        for (const id of rowIds) next[id] = { ...prev[id], sold: String(sold[id]) };
-        if (ice) next["nes-ice-16"] = { ...next["nes-ice-16"], oz16: String(ice) };
-        return next;
-      });
-      rowIds.forEach((id) => pendingRows.current.add(id));
-      if (ice) pendingRows.current.add("nes-ice-16");
-
-      if (flushTimer.current) clearTimeout(flushTimer.current);
-      flushTimer.current = setTimeout(() => void flush(date), 300);
-      toast.success(`เติมยอดขายจากใบสรุปแล้ว ${rowIds.length} รายการ`, { id: tid });
+      toast.dismiss(tid);
+      setReview(items);
     } catch (error) {
       const msg = error instanceof Error && error.message ? error.message : "";
       toast.error(msg && msg.length < 120 ? msg : "อ่านใบสรุปยอดไม่สำเร็จ ลองอีกครั้งครับ", {
@@ -188,6 +181,42 @@ export function StockSheet() {
     } finally {
       setScanning(false);
     }
+  };
+
+  /** ผู้ใช้กดยืนยันในหน้าต่างสรุป -> เขียนยอดขายลงชีตแล้วบันทึกขึ้นเซิร์ฟเวอร์ */
+  const applyReview = (items: ReviewRow[]) => {
+    const sold: Record<string, number> = {};
+    let ice = 0;
+    for (const it of items) {
+      if (it.key === "ice16") {
+        ice = it.qty; // น้ำแข็งเปล่าลงช่อง 16 OZ. ไม่ใช่ยอดขาย
+        continue;
+      }
+      const rowId = SCAN_TO_ROW[it.key];
+      if (rowId && it.qty > 0) sold[rowId] = (sold[rowId] ?? 0) + it.qty;
+    }
+    // น้ำแข็งเปล่า 16 ออนซ์ บวกเข้าไปในยอดขายแก้ว 16 ออนซ์ด้วย
+    if (ice > 0) sold["eq-cup-16"] = (sold["eq-cup-16"] ?? 0) + ice;
+
+    const rowIds = Object.keys(sold);
+    if (!rowIds.length && ice <= 0) {
+      setReview(null);
+      toast.info("ไม่มียอดจะบันทึก");
+      return;
+    }
+    setValues((prev) => {
+      const next = { ...prev };
+      for (const id of rowIds) next[id] = { ...prev[id], sold: String(sold[id]) };
+      if (ice > 0) next["nes-ice-16"] = { ...next["nes-ice-16"], oz16: String(ice) };
+      return next;
+    });
+    rowIds.forEach((id) => pendingRows.current.add(id));
+    if (ice > 0) pendingRows.current.add("nes-ice-16");
+
+    if (flushTimer.current) clearTimeout(flushTimer.current);
+    flushTimer.current = setTimeout(() => void flush(date), 300);
+    setReview(null);
+    toast.success(`บันทึกยอดขายจากใบสรุปแล้ว ${rowIds.length} รายการ`);
   };
 
 
@@ -585,6 +614,55 @@ export function StockSheet() {
 
 
       <ExpiryTracker />
+
+      <Dialog open={review !== null} onOpenChange={(o) => !o && setReview(null)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>ตรวจยอดก่อนบันทึก</DialogTitle>
+            <DialogDescription>
+              AI อ่านใบสรุปได้ตามนี้ แก้ตัวเลขให้ตรงก่อนกด “บันทึกลงชีต”
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="max-h-[50vh] divide-y divide-sheet-line overflow-y-auto">
+            {(review ?? []).map((it, idx) => (
+              <div key={it.key} className="flex items-center justify-between gap-3 py-2">
+                <span className="text-sm">{it.label}</span>
+                <input
+                  inputMode="numeric"
+                  value={String(it.qty)}
+                  onChange={(e) => {
+                    const q = Math.max(0, Number(e.target.value.replace(/[^\d]/g, "")) || 0);
+                    setReview(
+                      (prev) => prev?.map((r, i) => (i === idx ? { ...r, qty: q } : r)) ?? prev,
+                    );
+                  }}
+                  className="h-9 w-20 rounded-md border border-sheet-line bg-transparent px-2 text-right text-base font-bold tabular-nums outline-none"
+                />
+              </div>
+            ))}
+          </div>
+
+          {review?.some((r) => r.key === "cup16" || r.key === "ice16") && (
+            <p className="rounded-md bg-sheet-shade px-3 py-2 text-xs text-muted-foreground">
+              แก้ว 16 ออนซ์ ที่จะบันทึกในชีต ={" "}
+              <b className="text-sheet-ink">
+                {(review.find((r) => r.key === "cup16")?.qty ?? 0) +
+                  (review.find((r) => r.key === "ice16")?.qty ?? 0)}
+              </b>{" "}
+              ใบ (น้ำอัดลม {review.find((r) => r.key === "cup16")?.qty ?? 0} + น้ำแข็ง{" "}
+              {review.find((r) => r.key === "ice16")?.qty ?? 0})
+            </p>
+          )}
+
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button variant="outline" onClick={() => setReview(null)}>
+              ยกเลิก
+            </Button>
+            <Button onClick={() => review && applyReview(review)}>บันทึกลงชีต</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={reminderOpen} onOpenChange={setReminderOpen}>
         <DialogContent className="max-w-md overflow-hidden p-0 sm:max-w-lg">
